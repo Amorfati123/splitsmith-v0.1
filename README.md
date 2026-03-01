@@ -2,7 +2,7 @@
 
 ML dataset splitting with built-in leakage detection.
 
-splitsmith splits your data into train/val/test sets (or k-fold CV) and automatically audits for common data leakage patterns — index overlap, duplicate rows across splits, group leakage, and time leakage.
+splitsmith splits your data into train/val/test sets (or k-fold CV) and automatically audits for common data leakage patterns, index overlap, duplicate rows across splits, group leakage, and time leakage.
 
 ## Install
 

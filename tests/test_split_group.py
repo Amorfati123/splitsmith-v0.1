@@ -64,10 +64,17 @@ class TestGroupSplit:
         assert r.metadata["n_groups"] == 10
         assert "groups_per_split" in r.metadata
 
-    def test_stratify_not_supported(self):
+    def test_stratified_group_split_runs(self):
         df = _grouped_df()
-        with pytest.raises(NotImplementedError):
-            split(df, target="target", strategy="group", groups="group_id", stratify=True)
+        r = split(df, target="target", strategy="group", groups="group_id", stratify=True)
+        # Groups must still be exclusive across splits
+        train_g = set(df.iloc[r.train_idx]["group_id"].unique())
+        val_g = set(df.iloc[r.val_idx]["group_id"].unique())
+        test_g = set(df.iloc[r.test_idx]["group_id"].unique())
+        assert train_g.isdisjoint(val_g)
+        assert train_g.isdisjoint(test_g)
+        assert val_g.isdisjoint(test_g)
+        assert r.metadata["stratified"] is True
 
     def test_audit_integration(self):
         df = _grouped_df()

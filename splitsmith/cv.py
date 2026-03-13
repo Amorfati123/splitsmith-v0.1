@@ -21,6 +21,8 @@ def k_fold(
     groups: Optional[str] = None,
     time_col: Optional[str] = None,
     seed: int = 42,
+    gap: int = 0,
+    embargo: int = 0,
 ) -> CVResult:
     """K-fold cross-validation with multiple strategies.
 
@@ -33,6 +35,9 @@ def k_fold(
     groups : column name for group-aware strategies
     time_col : column name for time-aware strategies
     seed : random seed for determinism
+    gap : number of rows (or groups) to drop between train and val
+        in time-aware CV (embargo/purge window)
+    embargo : alias for gap; if both given, max is used
 
     Returns
     -------
@@ -51,6 +56,12 @@ def k_fold(
         raise TypeError("seed must be an int")
     if strategy not in _VALID_STRATEGIES:
         raise ValueError(f"Unknown strategy: {strategy!r}. Choose from: {', '.join(_VALID_STRATEGIES)}")
+    if not isinstance(gap, int) or gap < 0:
+        raise ValueError("gap must be a non-negative integer")
+    if not isinstance(embargo, int) or embargo < 0:
+        raise ValueError("embargo must be a non-negative integer")
+
+    effective_gap = max(gap, embargo)
 
     n = len(df)
     if n < k:
@@ -97,12 +108,18 @@ def k_fold(
         meta = {"strategy": "group", "k": k, "seed": seed, "n_rows": n, "n_groups": ng}
 
     elif strategy == "time":
-        folds, time_range = _time_folds(df, time_col, k, seed)
-        meta = {"strategy": "time", "k": k, "seed": seed, "n_rows": n, "time_range": time_range}
+        folds, time_range = _time_folds(df, time_col, k, seed, effective_gap)
+        meta = {
+            "strategy": "time", "k": k, "seed": seed, "n_rows": n,
+            "gap": effective_gap, "time_range": time_range,
+        }
 
     else:  # group_time
-        folds, ng = _group_time_folds(df, groups, time_col, k, seed)
-        meta = {"strategy": "group_time", "k": k, "seed": seed, "n_rows": n, "n_groups": ng}
+        folds, ng = _group_time_folds(df, groups, time_col, k, seed, effective_gap)
+        meta = {
+            "strategy": "group_time", "k": k, "seed": seed, "n_rows": n,
+            "gap": effective_gap, "n_groups": ng,
+        }
 
     return CVResult(folds=folds, metadata=meta)
 
@@ -188,8 +205,14 @@ def _iso_range(values: pd.Series) -> Dict[str, str]:
     return {"min": values.min().isoformat(), "max": values.max().isoformat()}
 
 
-def _time_folds(df: pd.DataFrame, time_col: str, k: int, seed: int) -> Tuple[List[FoldResult], Dict[str, str]]:
-    """Forward-chaining: train grows each fold, val is always the next block."""
+def _time_folds(
+    df: pd.DataFrame, time_col: str, k: int, seed: int, gap: int = 0,
+) -> Tuple[List[FoldResult], Dict[str, str]]:
+    """Forward-chaining: train grows each fold, val is always the next block.
+
+    With gap > 0, *gap* rows are dropped between the end of train and the
+    start of val in each fold (embargo / purge window).
+    """
     time_series = pd.to_datetime(df[time_col])
     sorted_idx = np.argsort(time_series.values, kind="stable").astype(int)
     row_blocks = [b.astype(int, copy=False) for b in np.array_split(sorted_idx, k + 1)]
@@ -198,10 +221,15 @@ def _time_folds(df: pd.DataFrame, time_col: str, k: int, seed: int) -> Tuple[Lis
     for i in range(k):
         train_idx = np.concatenate(row_blocks[: i + 1]).astype(int, copy=False)
         val_idx = row_blocks[i + 1]
+
+        # Apply gap: drop the last `gap` rows from train
+        if gap > 0 and len(train_idx) > gap:
+            train_idx = train_idx[:-gap]
+
         train_time = pd.to_datetime(df.iloc[train_idx][time_col])
         val_time = pd.to_datetime(df.iloc[val_idx][time_col])
         meta = {
-            "fold": i, "strategy": "time", "seed": seed,
+            "fold": i, "strategy": "time", "seed": seed, "gap": gap,
             "train_time_range": _iso_range(train_time),
             "val_time_range": _iso_range(val_time),
         }
@@ -211,9 +239,13 @@ def _time_folds(df: pd.DataFrame, time_col: str, k: int, seed: int) -> Tuple[Lis
 
 
 def _group_time_folds(
-    df: pd.DataFrame, groups: str, time_col: str, k: int, seed: int,
+    df: pd.DataFrame, groups: str, time_col: str, k: int, seed: int, gap: int = 0,
 ) -> Tuple[List[FoldResult], int]:
-    """Forward-chaining on groups sorted by their max timestamp."""
+    """Forward-chaining on groups sorted by their max timestamp.
+
+    With gap > 0, the last `gap` groups from the training set are dropped
+    in each fold to create an embargo window.
+    """
     time_series = pd.to_datetime(df[time_col])
     max_times = time_series.groupby(df[groups]).max()
 
@@ -226,14 +258,21 @@ def _group_time_folds(
 
     folds = []
     for i in range(k):
-        train_groups = set(g for block in group_blocks[: i + 1] for g in block)
-        val_groups = set(group_blocks[i + 1])
+        all_train_groups = [g for block in group_blocks[: i + 1] for g in block]
+        val_groups_list = group_blocks[i + 1]
+
+        # Apply gap: drop the last `gap` groups from training
+        if gap > 0 and len(all_train_groups) > gap:
+            all_train_groups = all_train_groups[:-gap]
+
+        train_groups = set(all_train_groups)
+        val_groups = set(val_groups_list)
         train_idx = np.where(group_col.isin(train_groups))[0].astype(int)
         val_idx = np.where(group_col.isin(val_groups))[0].astype(int)
         train_time = pd.to_datetime(df.iloc[train_idx][time_col])
         val_time = pd.to_datetime(df.iloc[val_idx][time_col])
         meta = {
-            "fold": i, "strategy": "group_time", "seed": seed,
+            "fold": i, "strategy": "group_time", "seed": seed, "gap": gap,
             "n_groups_train": len(train_groups), "n_groups_val": len(val_groups),
             "train_time_range": _iso_range(train_time),
             "val_time_range": _iso_range(val_time),
